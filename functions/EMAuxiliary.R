@@ -1,243 +1,300 @@
-# EMAuxiliary.R
 # -------------------------------------------------------------------
-# BLIMP wrapper for lme4-style formulas using explicit `.mean` tokens.
-# - No w()/b() markers. You write x and/or x.mean explicitly.
-# - Example focal model: y ~ x + x.mean + x:x.mean + (1 + x | id)
-# - To *use* x.mean, you must also list the base in center_group (e.g., center_group="x").
-# - Auxiliaries are standardized (z-scored) if numeric.
-# - Aux RHS follows rules described in the comments below.
-# - Adds: chains=, nominal=, center_group=, center_grand=
-# - Provides: blimp_print_psr(), blimp_print_focal()
+# EMAuxiliary — lme4-style to BLIMP with auxiliaries (.mean route)
 # -------------------------------------------------------------------
 
-EMAuxiliary <- function(formula,
-                       data,
-                       id,
-                       aux = NULL,
-                       ordinal = NULL,
-                       nominal = NULL,
-                       center_group = NULL,   # e.g., c("x","time","y") to make x.mean, time.mean, y.mean available
-                       center_grand = NULL,   # e.g., c("x.mean","time.mean") to GM-center those between parts
-                       burn = 5000,
-                       iter = 10000,
-                       chains = 2,
-                       seed = 12345) {
+# Helpers: safe sd, ICC, level detection ---------------------------------------
+
+.safe_sd <- function(x) {
+  x <- as.numeric(x)
+  if (!length(x)) return(NA_real_)
+  stats::sd(x, na.rm = TRUE)
+}
+
+.icc_est <- function(x, id) {
+  # One-way random effects ICC estimate from raw data (NA-tolerant)
+  ok <- !is.na(x) & !is.na(id)
+  x  <- x[ok]; id <- id[ok]
+  if (!length(x)) return(NA_real_)
+  # within-cluster variances and means
+  v_within <- tapply(x, id, function(z) stats::var(z, na.rm = TRUE))
+  m_by     <- tapply(x, id, function(z) mean(z, na.rm = TRUE))
+  vw <- mean(v_within, na.rm = TRUE)
+  vb <- stats::var(m_by, na.rm = TRUE)
+  if (!is.finite(vw) || !is.finite(vb)) return(NA_real_)
+  tot <- vb + vw
+  if (tot <= 0) return(NA_real_)
+  vb / tot
+}
+
+.is_level2_var <- function(vname, data, id) {
+  if (!vname %in% names(data)) return(FALSE)
+  sds <- tapply(data[[vname]], data[[id]], function(z) stats::sd(z, na.rm = TRUE))
+  all(is.na(sds) | sds < 1e-8)
+}
+
+# Token utilities ---------------------------------------------------------------
+
+# Convert raw term labels (possibly with .mean already present) to BLIMP tokens
+# We keep ":" while validating, then later convert ":" -> "*".
+.tokens_from_terms <- function(terms_vec) {
+  # terms_vec is like c("x", "x:x.mean", "m", "x.mean")
+  terms_vec[is.na(terms_vec)] <- ""
+  terms_vec[nzchar(terms_vec)]
+}
+
+# Extract "base" predictor names that appear as main effects (no interactions)
+.base_terms_from_formula <- function(fml) {
+  tl_raw <- attr(stats::terms(lme4::nobars(fml)), "term.labels")
+  main   <- unique(unlist(strsplit(tl_raw, ":", fixed = TRUE)))
+  main   <- main[nzchar(main)]
+  # strip ".mean" suffix from bases
+  sub("\\.mean$", "", main)
+}
+
+# Standardize selected columns in-place (z-score)
+.standardize_inplace <- function(df, cols) {
+  zcols <- intersect(cols, names(df))
+  if (!length(zcols)) return(list(data = df, changed = character(0)))
+  changed <- character(0)
+  for (v in zcols) {
+    x <- df[[v]]
+    if (is.numeric(x)) {
+      sdv <- stats::sd(x, na.rm = TRUE)
+      if (is.finite(sdv) && sdv > 0) {
+        df[[v]] <- as.numeric(scale(x)[,1])
+        changed <- c(changed, v)
+      }
+    }
+  }
+  list(data = df, changed = unique(changed))
+}
+
+# Mean token chooser for auxiliaries:
+# - if predictor is pure L2 => use raw name (no ".mean")
+# - else => use "name.mean"
+.mean_token <- function(xname, data, id) {
+  if (.is_level2_var(xname, data, id)) xname else paste0(xname, ".mean")
+}
+
+# BLIMP last PSR reader (final row's Highest PSR)
+.blimp_last_psr <- function(blimp_fit) {
+  out <- utils::capture.output(rblimp::output(blimp_fit))
+  start <- grep("^\\s*BURN-IN POTENTIAL SCALE REDUCTION \\(PSR\\) OUTPUT:", out)
+  if (!length(start)) return(NA_real_)
+  # Find the last "Comparing iterations" line in the block
+  block <- out[(start[1]):length(out)]
+  cmp   <- grep("^\\s*Comparing iterations", block)
+  if (!length(cmp)) return(NA_real_)
+  last  <- block[tail(cmp, 1)]
+  # Extract the number just before "Parameter"
+  m <- regmatches(last, regexpr("\\s([0-9]+\\.[0-9]+)\\s+Parameter", last))
+  as.numeric(trimws(sub("Parameter.*$", "", sub("^\\s*", "", m))))
+}
+
+# ------------------------------------------------------------------------------
+# EMAuxiliary(): main wrapper
+# ------------------------------------------------------------------------------
+
+EMAuxiliary <- function(
+  formula,
+  data,
+  id,
+  aux = NULL,
+  ordinal = NULL,
+  nominal = NULL,
+  center_group = NULL,   # variables to group-mean center (enables x.mean)
+  center_grand = NULL,   # variables to grand-mean center (not related to .mean)
+  burn = 5000,
+  iter = 10000,
+  chains = 2,
+  seed = 12345
+) {
   stopifnot(is.data.frame(data))
   if (!requireNamespace("lme4", quietly = TRUE)) stop("Install lme4.")
   if (!requireNamespace("rblimp", quietly = TRUE)) stop("Install rblimp.")
-  
-  # ----------------------- small helpers ----------------------------
-  .is_num <- function(x) is.numeric(x) && !is.factor(x)
-  .safe_sd <- function(v) if (is.null(v) || !is.numeric(v)) NA_real_ else stats::sd(v, na.rm = TRUE)
-  .strip_space <- function(x) x[nzchar(trimws(x))]
-  
-  # escape a variable name for regex in blimp_print_focal
-  .re_esc <- function(s) gsub("([][{}()+*.^$|?\\\\])", "\\\\\\1", s, perl = TRUE)
-  
-  # detect L2-only variables (constant within clusters)
-  .is_L2 <- function(vname) {
-    if (!vname %in% names(data)) return(FALSE)
-    sds <- tapply(data[[vname]], data[[id]], function(z) stats::sd(z, na.rm = TRUE))
-    all(is.na(sds) | sds < 1e-8)
-  }
-  
-  # quick ICC for auxiliaries (returns NA if not computable)
-  .icc <- function(vname) {
-    if (!vname %in% names(data)) return(NA_real_)
-    z <- data[[vname]]
-    grp <- data[[id]]
-    if (!is.numeric(z)) return(NA_real_)
-    m_j <- tapply(z, grp, mean, na.rm = TRUE)
-    v_b <- stats::var(m_j, na.rm = TRUE)
-    v_w <- mean(tapply(z, grp, function(a) stats::var(a, na.rm = TRUE)), na.rm = TRUE)
-    if (is.na(v_b) || is.na(v_w)) return(NA_real_)
-    if ((v_b + v_w) <= 0) return(NA_real_)
-    v_b / (v_b + v_w)
-  }
-  
-  # ------------------ parse focal model (no random parts) -----------
+
+  # Fixed part and random part
   fixed_form <- lme4::nobars(formula)
-  tl_raw <- attr(terms(fixed_form), "term.labels")  # tokens like c("x", "x.mean", "x:x.mean", ...)
-  tl_raw <- if (length(tl_raw)) tl_raw else character(0)
-  
-  # Build BLIMP tokens by replacing ":" with "*"
-  blimp_terms <- if (length(tl_raw)) gsub(":", "*", tl_raw, fixed = TRUE) else character(0)
-  rhs_tokens <- unique(blimp_terms)
-  fixed_rhs  <- if (length(rhs_tokens)) paste(rhs_tokens, collapse = " ") else "1"
-  
-  # outcome
-  y <- deparse(formula[[2L]])
-  
-  # -------------------- centering logic (explicit) ------------------
-  # Users must request cluster means for any base that appears as "base.mean" in the formula.
-  # We do NOT silently add those bases (to avoid altering the user's raw x scaling).
-  # However, if aux != NULL, we *do* ensure y.mean is available by adding y to group-mean list.
-  
-  base_names_in_means <- {
-    m <- grep("\\.mean\\b", rhs_tokens, value = TRUE)
-    if (length(m)) unique(sub("\\.mean$", "", m)) else character(0)
-  }
-  
-  cg <- unique(.strip_space(center_group))
-  gg <- unique(.strip_space(center_grand))
-  
-  # Require bases for any *.mean that appear in the focal RHS
-  missing_bases <- setdiff(base_names_in_means, cg)
-  if (length(missing_bases)) {
-    stop(
-      "You used '", paste0(missing_bases, collapse = ", "),
-      ".mean' in the formula but did not include the base name(s) in `center_group`.\n",
-      "Add: center_group = c(", paste(sprintf('"%s"', missing_bases), collapse = ", "), ", ...).",
-      call. = FALSE
-    )
-  }
-  
-  # Ensure y.mean exists for auxiliary equations (only if aux are provided).
-  if (!is.null(aux) && length(aux)) {
-    if (!y %in% cg) cg <- c(cg, y)
-  }
-  
-  # Grand-mean centering: user should pass tokens like "x.mean"
-  # Validate that anything in center_grand actually ends with ".mean"
-  wrong_gg <- gg[!grepl("\\.mean$", gg)]
-  if (length(wrong_gg)) {
-    stop("`center_grand` must list between tokens that end with '.mean'. Bad value(s): ",
-         paste(wrong_gg, collapse = ", "), call. = FALSE)
-  }
-  
-  # Render CENTER block
-  center_lines <- character(0)
-  if (length(cg)) center_lines <- c(center_lines, paste0("groupmean = ", paste(unique(cg), collapse = " "), ";"))
-  if (length(gg)) center_lines <- c(center_lines, paste0("grandmean = ", paste(unique(gg), collapse = " "), ";"))
-  center_block <- if (length(center_lines)) paste("CENTER:", paste(center_lines, collapse = " "), sep = "\n  ") else NULL
-  
-  # -------------------- random slopes (from original formula) -------
-  fb <- lme4::findbars(formula)
+  fb         <- lme4::findbars(formula)      # random terms
   rand_slopes <- character(0)
   if (length(fb)) {
     inside_terms <- unique(unlist(lapply(fb, function(b) {
       left <- deparse(b[[2]])
-      attr(terms(as.formula(paste("~", left))), "term.labels")
+      attr(stats::terms(as.formula(paste("~", left))), "term.labels")
     })))
     rand_slopes <- setdiff(inside_terms, "1")
   }
-  
-  # Disallow ordinal/nominal as random-slope predictors
-  bad_rs <- intersect(rand_slopes, c(ordinal, nominal))
-  if (length(bad_rs)) {
-    stop("Categorical (ordinal/nominal) variables cannot be random-slope predictors: ",
-         paste(bad_rs, collapse = ", "), call. = FALSE)
+
+  # Outcome name
+  y <- deparse(formula[[2L]])
+
+  # ---------------- Build RHS with .mean validation ---------------------------
+
+  # Raw term labels with ":" to split later; keep as-is
+  tl_raw <- attr(stats::terms(fixed_form), "term.labels")
+  tl_raw <- tl_raw[nzchar(tl_raw)]
+  rhs_tokens_colon <- .tokens_from_terms(tl_raw)
+
+  # Split interactions into atomic bits to find any *.mean in use
+  rhs_atoms <- unique(unlist(strsplit(rhs_tokens_colon, ":", fixed = TRUE)))
+  rhs_atoms <- rhs_atoms[nzchar(rhs_atoms)]
+  means_in_rhs <- unique(sub("\\.mean$", "", rhs_atoms[grepl("\\.mean$", rhs_atoms)]))
+
+  # Validation: every base that appears as *.mean must be in center_group (or be y)
+  cg_allow <- unique(c(center_group, y)) # y.mean is allowed even if user didn't list it
+  cg_allow <- cg_allow[!is.na(cg_allow) & nzchar(cg_allow)]
+  missing_bases <- setdiff(means_in_rhs, cg_allow)
+  if (length(missing_bases)) {
+    stop(
+      "You used ", paste0(paste0(missing_bases, ".mean"), collapse = ", "),
+      " in the formula but did not include the base name(s) in `center_group`.\n",
+      "Add: center_group = c(", paste(sprintf('\"%s\"', missing_bases), collapse = ", "), ", ...).",
+      call. = FALSE
+    )
   }
-  
-  # Assemble focal model line
-  if (!length(rand_slopes)) {
-    model_line <- paste0("MODEL:\n  ", y, " ~ ", fixed_rhs, ";")
-    blimp_model_arg <- paste0(y, " ~ ", fixed_rhs)
-  } else {
-    model_line <- paste0("MODEL:\n  ", y, " ~ ", fixed_rhs, " | ", paste(rand_slopes, collapse = " "), ";")
-    blimp_model_arg <- paste0(y, " ~ ", fixed_rhs, " | ", paste(rand_slopes, collapse = " "))
-  }
-  
-  # --------------------- standardize numeric auxiliaries ------------
-  data_work <- data
-  if (!is.null(aux) && length(aux)) {
-    for (a in aux) {
-      if (a %in% names(data_work) && .is_num(data_work[[a]])) {
-        data_work[[a]] <- as.numeric(scale(data_work[[a]], center = TRUE, scale = TRUE)[,1])
-      }
+
+  # Now produce the '*' BLIMP RHS tokens
+  blimp_terms <- if (length(rhs_tokens_colon)) gsub(":", "*", rhs_tokens_colon, fixed = TRUE) else character(0)
+  rhs_tokens  <- unique(blimp_terms)
+  fixed_rhs   <- if (length(rhs_tokens)) paste(rhs_tokens, collapse = " ") else "1"
+
+  # ---------------- Random slopes: forbid ordinal/nominal and *.mean ----------
+
+  slope_vars <- rand_slopes
+  if (length(slope_vars)) {
+    # strip possible ".mean" if someone wrote it (random slopes must be L1)
+    if (any(grepl("\\.mean\\b", slope_vars))) {
+      stop("Random slopes may only be on Level-1 predictors; do not use '*.mean' in random-slope terms.")
+    }
+    # Disallow ordinal/nominal as random slopes
+    bad_on_slopes <- intersect(slope_vars, unique(c(ordinal %||% character(0), nominal %||% character(0))))
+    if (length(bad_on_slopes)) {
+      stop("Ordinal/nominal variables cannot appear as random-slope terms: ",
+           paste(bad_on_slopes, collapse = ", "))
     }
   }
-  
-  # ------------------ build auxiliary.model block -------------------
-  aux_block <- NULL
-  aux_model_arg <- NULL
-  
-  if (!is.null(aux) && length(aux)) {
-    # We need:
-    # - main "base" predictors (no interactions) as raw tokens
-    # - full RHS tokens (include interactions, may contain *.mean)
-    # - classification of auxiliaries via ICC
-    main_bases <- unique(unlist(strsplit(tl_raw, ":", fixed = TRUE)))
-    main_bases <- main_bases[nzchar(main_bases)]
-    
-    full_rhs <- rhs_tokens
-    
-    # Helper: choose mean token for a base var if needed in between-level RHS
-    # If predictor is L2-only -> use raw name, else use base.mean
-    mean_token <- function(xname) {
-      if (.is_L2(xname)) xname else paste0(xname, ".mean")
-    }
-    
-    # Rule buckets:
-    # - pure-between aux: ICC ~ 1.0 (we'll use .is_L2() as a stronger condition)
-    # - near-pure within: ICC < .05  => use y + main_bases (no *.mean)
-    # - multi-level: otherwise => use y + y.mean + full RHS tokens
-    
-    aux_lines <- character(0)
-    
-    for (a in aux) {
-      # Skip if aux not in data
-      if (!a %in% names(data_work)) next
-      
-      a_is_L2 <- .is_L2(a)
-      a_icc   <- .icc(a)
-      
-      if (isTRUE(a_is_L2)) {
-        # PURE BETWEEN auxiliary:
-        #   RHS: y.mean + main effects, with predictors mapped to *.mean unless they are pure L2 themselves
-        rhs_means <- unique(c(paste0(y, ".mean"),
-                              vapply(main_bases, mean_token, character(1))))
-        rhs <- rhs_means
-      } else if (is.finite(a_icc) && a_icc < 0.05) {
-        # NEAR-PURE WITHIN auxiliary:
-        #   RHS: y + main effects (raw), no *.mean even if present in focal
-        rhs <- unique(c(y, main_bases))
-      } else {
-        # MULTI-LEVEL auxiliary:
-        #   RHS: y + y.mean + FULL RHS tokens (including interactions and any *.mean the user requested)
-        rhs <- unique(c(y, paste0(y, ".mean"), full_rhs))
+
+  # ---------------- Build CENTER blocks --------------------------------------
+
+  # We pass exactly what the user requested for predictors:
+  # - center_group → groupmean
+  # - center_grand → grandmean
+  # Additionally, if auxiliaries are used, we add y to groupmean so
+  # we can legally use y.mean in auxiliary RHS (no effect on focal RHS scaling).
+  center_group_to_pass <- unique(c(center_group, if (length(aux)) y))
+  center_group_to_pass <- center_group_to_pass[!is.na(center_group_to_pass) & nzchar(center_group_to_pass)]
+  center_grand_to_pass <- unique(center_grand)
+  center_grand_to_pass <- center_grand_to_pass[!is.na(center_grand_to_pass) & nzchar(center_grand_to_pass)]
+
+  center_lines <- character(0)
+  if (length(center_group_to_pass))
+    center_lines <- c(center_lines, paste0("groupmean = ", paste(center_group_to_pass, collapse = " ")))
+  if (length(center_grand_to_pass))
+    center_lines <- c(center_lines, paste0("grandmean = ", paste(center_grand_to_pass, collapse = " ")))
+  center_block <- if (length(center_lines)) paste0("CENTER: ", paste(center_lines, collapse = "; "), ";") else NULL
+
+  # ---------------- Auxiliary model construction ------------------------------
+
+  # Base predictors (no interactions): their raw names (strip .mean suffix)
+  base_preds <- .base_terms_from_formula(formula)
+
+  # Determine L1 vs L2 for auxiliaries
+  aux <- aux %||% character(0)
+  aux <- unique(aux[nzchar(aux)])
+
+  # ICC and "near pure L1" test: ICC < .05
+  aux_icc <- setNames(rep(NA_real_, length(aux)), aux)
+  for (a in aux) {
+    if (a %in% names(data)) aux_icc[a] <- .icc_est(data[[a]], data[[id]])
+  }
+  near_L1 <- names(aux_icc)[which(is.finite(aux_icc) & aux_icc < 0.05)]
+
+  # Predictor pools for aux RHS:
+  # Mixed-level aux → use full RHS (including interactions) + y + y.mean
+  full_rhs_for_aux <- rhs_tokens_colon
+  # L1-only aux (near_L1) → y + base x’s only (no .mean)
+  # Pure L2 aux → y.mean + L2 predictors / means of mixed predictors
+
+  # Helper to detect if an aux is L2-only
+  aux_is_L2 <- function(a) .is_level2_var(a, data, id)
+
+  # Build RHS per aux variable
+  aux_lines <- character(0)
+  for (a in aux) {
+    if (aux_is_L2(a)) {
+      # Pure L2 aux: only y.mean and L2 predictors (raw L2 names or x.mean forms)
+      L2_preds <- character(0)
+      for (p in base_preds) {
+        if (.is_level2_var(p, data, id)) {
+          L2_preds <- c(L2_preds, p)  # pure L2 stays raw
+        } else {
+          # mixed predictor: use p.mean
+          L2_preds <- c(L2_preds, paste0(p, ".mean"))
+        }
       }
-      
-      # Drop self-prediction and any empties
-      rhs <- rhs[!is.na(rhs) & nzchar(rhs) & rhs != a]
-      
-      if (length(rhs)) {
+      rhs <- unique(c(paste0(y, ".mean"), L2_preds))
+      rhs <- rhs[nzchar(rhs)]
+      if (length(rhs))
         aux_lines <- c(aux_lines, paste0(a, " ~ ", paste(rhs, collapse = " "), ";"))
-      }
-    }
-    
-    if (length(aux_lines)) {
-      aux_block <- paste0("auxiliary.model:\n  ", paste(aux_lines, collapse = "\n  "))
-      aux_model_arg <- paste(aux_lines, collapse = "\n  ")
+
+    } else if (a %in% near_L1) {
+      # Near pure L1 aux: only y and base x’s (no .mean, no interactions)
+      rhs <- unique(c(y, base_preds))
+      rhs <- rhs[rhs != a & nzchar(rhs)]
+      if (length(rhs))
+        aux_lines <- c(aux_lines, paste0(a, " ~ ", paste(rhs, collapse = " "), ";"))
+
+    } else {
+      # Mixed-level aux: y + y.mean + full focal RHS (incl. interactions)
+      rhs <- unique(c(y, paste0(y, ".mean"), full_rhs_for_aux))
+      rhs <- rhs[rhs != a & nzchar(rhs)]
+      if (length(rhs))
+        aux_lines <- c(aux_lines, paste0(a, " ~ ", paste(rhs, collapse = " "), ";"))
     }
   }
-  
-  # ------------------------- VARIABLES block ------------------------
-  # Include id, y, every raw base token (split on ':'), any *.mean tokens explicitly used,
-  # plus any aux/ordinal/nominal variables.
-  raw_bases <- unique(unlist(strsplit(tl_raw, ":", fixed = TRUE)))
-  raw_bases <- raw_bases[nzchar(raw_bases)]
-  # Collect explicit .mean tokens from formula (user responsibility)
-  explicit_means <- unique(grep("\\.mean\\b", tl_raw, value = TRUE))
-  explicit_means <- unique(sub("^(.+)$", "\\1", explicit_means)) # keep as written
-  
-  # VARIABLES must list observed names (no *.mean here).
-  # So strip ".mean" for inclusion in VARIABLES (they are constructed by CENTER).
-  vars_needed <- unique(c(
-    id, y,
-    raw_bases,
-    sub("\\.mean$", "", explicit_means),
-    aux, ordinal, nominal
-  ))
-  vars_needed <- vars_needed[vars_needed %in% names(data_work)]
-  vars_needed <- .strip_space(vars_needed)
-  
+
+  aux_block <- if (length(aux_lines)) paste0("auxiliary.model:\n  ", paste(aux_lines, collapse = "\n  ")) else NULL
+  aux_model_arg <- if (length(aux_lines)) paste(aux_lines, collapse = "\n  ") else NULL
+
+  # ---------------- VARIABLES list (observed only) ----------------------------
+
+  # All variables referenced as observed in BLIMP (exclude .mean tokens)
+  rhs_observed_atoms <- unique(unlist(strsplit(rhs_tokens_colon, ":", fixed = TRUE)))
+  rhs_observed_bases <- unique(sub("\\.mean$", "", rhs_observed_atoms))
+  all_vars <- unique(c(id, y, rhs_observed_bases, aux, ordinal, nominal))
+  all_vars <- all_vars[nzchar(all_vars)]
+
+  # ---------------- Auto-standardize continuous auxiliaries -------------------
+
+  data_run <- data
+  cont_aux <- aux[aux %in% names(data_run)]
+  # avoid scaling ordinal/nominal auxiliaries
+  cat_vars <- unique(c(ordinal %||% character(0), nominal %||% character(0)))
+  cont_aux <- setdiff(cont_aux, cat_vars)
+  # keep only numeric
+  cont_aux <- cont_aux[vapply(cont_aux, function(v) is.numeric(data_run[[v]]), logical(1))]
+  if (length(cont_aux)) {
+    std_res <- .standardize_inplace(data_run, cont_aux)
+    if (length(std_res$changed)) {
+      message("Standardized auxiliaries (z): ", paste(std_res$changed, collapse = ", "))
+    }
+    data_run <- std_res$data
+  }
+
+  # ---------------- Compose BLIMP code (for printing only) --------------------
+
+  model_line <- if (!length(slope_vars)) {
+    paste0("MODEL:\n  ", y, " ~ ", fixed_rhs, ";")
+  } else {
+    paste0("MODEL:\n  ", y, " ~ ", fixed_rhs, " | ", paste(slope_vars, collapse = " "), ";")
+  }
+
   blimp_code <- paste(
     "DATA: <in-memory by rblimp>;",
-    paste0("VARIABLES: ", paste(vars_needed, collapse = " "), ";"),
+    paste0("VARIABLES: ", paste(all_vars, collapse = " "), ";"),
     paste0("CLUSTERID: ", id, ";"),
-    if (!is.null(ordinal) && length(ordinal)) paste0("ORDINAL: ", paste(ordinal, collapse = " "), ";") else NULL,
-    if (!is.null(nominal) && length(nominal)) paste0("NOMINAL: ", paste(nominal, collapse = " "), ";") else NULL,
+    if (length(ordinal %||% character(0))) paste0("ORDINAL: ", paste(ordinal, collapse = " "), ";") else NULL,
+    if (length(nominal %||% character(0))) paste0("NOMINAL: ", paste(nominal, collapse = " "), ";") else NULL,
     if (!is.null(center_block)) center_block else NULL,
     model_line,
     if (!is.null(aux_block)) aux_block else NULL,
@@ -247,160 +304,157 @@ EMAuxiliary <- function(formula,
     paste0("CHAINS: ", chains, ";"),
     sep = "\n"
   )
-  
-  # ----------------------------- run BLIMP --------------------------
+
+  # ---------------- Run BLIMP -------------------------------------------------
+
   args <- list(
-    data = data_work,
+    data      = data_run,
     clusterid = id,
-    model = blimp_model_arg,
-    seed = seed,
-    burn = burn,
-    iter = iter,
-    chains = chains
+    model     = paste0(y, " ~ ", fixed_rhs, if (length(slope_vars)) paste0(" | ", paste(slope_vars, collapse = " ")) else ""),
+    seed      = seed,
+    burn      = burn,
+    iter      = iter,
+    chains    = chains
   )
-  if (length(cg)) {
-    args$center <- paste0(
-      paste0("groupmean = ", paste(unique(cg), collapse = " ")),
-      if (length(gg)) paste0("; grandmean = ", paste(unique(gg), collapse = " ")) else ""
-    )
-  } else if (length(gg)) {
-    # grandmean without groupmean is allowed (for tokens already created by user elsewhere),
-    # but in BLIMP practice, *.mean come from groupmean. We'll pass anyway if user insists.
-    args$center <- paste0("grandmean = ", paste(unique(gg), collapse = " "))
+  if (length(center_group_to_pass) || length(center_grand_to_pass)) {
+    center_pieces <- character(0)
+    if (length(center_group_to_pass))
+      center_pieces <- c(center_pieces, paste0("groupmean = ", paste(center_group_to_pass, collapse = " ")))
+    if (length(center_grand_to_pass))
+      center_pieces <- c(center_pieces, paste0("grandmean = ", paste(center_grand_to_pass, collapse = " ")))
+    args$center <- paste(center_pieces, collapse = "; ")
   }
-  fm <- names(formals(rblimp::rblimp))
-  if (!is.null(ordinal) && length(ordinal) && "ordinal" %in% fm) args$ordinal <- paste(ordinal, collapse = " ")
-  if (!is.null(nominal) && length(nominal) && "nominal" %in% fm) args$nominal <- paste(nominal, collapse = " ")
+  if (length(ordinal %||% character(0))) args$ordinal <- paste(ordinal, collapse = " ")
+  if (length(nominal %||% character(0))) args$nominal <- paste(nominal, collapse = " ")
+
+  # pass auxiliary model through a recognized arg name if available
   if (!is.null(aux_model_arg)) {
+    fm <- names(formals(rblimp::rblimp))
     aux_names <- c("auxiliary.model", "auxmodel", "auxiliarymodel", "auxiliary")
     matched <- intersect(aux_names, fm)
     if (length(matched)) {
       args[[matched[1]]] <- aux_model_arg
     } else {
       # inline fallback
-      args$model <- paste0(blimp_model_arg, ";\nauxiliary.model:\n  ", aux_model_arg, ";")
+      args$model <- paste0(args$model, ";\nauxiliary.model:\n  ", aux_model_arg, ";")
     }
   }
-  
-  fit <- do.call(rblimp::rblimp, args)
-  
-  # ---------------------- PSR + scale-audit warning -----------------
-  psr <- tryCatch(blimp_last_psr(fit), error = function(e) NA_real_)
+
+  fit <- rblimp::rblimp(
+    data      = args$data,
+    clusterid = args$clusterid,
+    model     = args$model,
+    seed      = args$seed,
+    burn      = args$burn,
+    iter      = args$iter,
+    chains    = args$chains,
+    center    = args$center %||% NULL,
+    ordinal   = args$ordinal %||% NULL,
+    nominal   = args$nominal %||% NULL,
+    `auxiliary.model` = args[["auxiliary.model"]] %||% NULL
+  )
+
+  # ---------------- PSR + scale audit (only if PSR > 1.05) -------------------
+
+  psr <- tryCatch(.blimp_last_psr(fit), error = function(e) NA_real_)
   if (is.finite(psr) && psr > 1.05) {
-    # scale audit across focal *observed* columns (y and main bases)
-    base_cols <- unique(.strip_space(unlist(strsplit(tl_raw, ":", fixed = TRUE))))
-    focal_cols <- unique(c(y, base_cols))
+    header <- sprintf(
+      "Final PSR is %.3f. The final PSR should be < 1.05.\nResults may be unreliable. Consider longer burn/iter, more chains, or simplifying auxiliaries.\n",
+      psr
+    )
+    # scale audit on focal variables (y + base predictors)
+    base_preds_for_audit <- base_preds[base_preds %in% names(data)]
+    focal_cols <- unique(c(y, base_preds_for_audit))
     sds <- vapply(focal_cols, function(v) .safe_sd(data[[v]]), numeric(1))
     sd_ok <- sds[is.finite(sds) & sds > 0]
     ratio_thresh <- 6
     abs_thresh   <- 3
-    
-    msg <- sprintf("Final PSR is %.3f. The final PSR should be < 1.05.\n", psr)
-    add <- ""
+    addendum <- NULL
     if (length(sd_ok) >= 1) {
-      max_sd <- max(sd_ok); min_sd <- min(sd_ok); ratio <- if (length(sd_ok) >= 2) max_sd / min_sd else 1
+      max_sd <- max(sd_ok); min_sd <- min(sd_ok)
+      ratio  <- if (length(sd_ok) >= 2) max_sd/min_sd else 1
       trigger <- (length(sd_ok) >= 2 && ratio > ratio_thresh) || any(sd_ok > abs_thresh)
       if (trigger) {
         sd_tbl <- paste(sprintf("  %s: %.3f", names(sds), sds), collapse = "\n")
-        add <- paste0(
+        addendum <- paste0(
           "Potential cause for poor PSR: large scale differences among focal variables.\n",
           sprintf("  max SD = %.3f, min SD = %.3f, max/min = %.2f (thresholds: ratio > %g OR any SD > %g)\n",
                   max_sd, min_sd, ratio, ratio_thresh, abs_thresh),
           "Focal SDs:\n", sd_tbl, "\n\n",
-          "Tip: Consider z-scaling y and large-SD predictors BEFORE calling blimp_wrap().\n"
+          "Tip: Consider rescaling (e.g., z-scaling) outcome and largest-SD predictors BEFORE calling EMAuxiliary()."
         )
       }
     }
-    warning(paste0(msg, add, "Consider longer burn/iter, more chains, or simplifying the model."), call. = FALSE)
+    warning(paste0(header, if (!is.null(addendum)) paste0("\n", addendum) else ""), call. = FALSE)
   }
-  
-  # ------------------------------ return ----------------------------
-  structure(list(
-    blimp_code = blimp_code,
-    fit = fit,
-    meta = list(y = y, id = id)
-  ), class = "blimp_wrap_fit")
+
+  # Return
+  structure(
+    list(
+      blimp_code = blimp_code,
+      fit        = fit,
+      meta       = list(y = y)
+    ),
+    class = "EMAuxiliary_fit"
+  )
 }
 
-# ------------------------- Printers/helpers -------------------------
+# ------------------------------------------------------------------------------
+# Printers
+# ------------------------------------------------------------------------------
 
-print.blimp_wrap_fit <- function(x, ...) {
-  cat("BLIMP code (explicit .mean idiom):\n")
-  cat("----------------------------------\n")
-  cat(x$blimp_code, "\n\n")
-  cat("BLIMP output (first lines; use rblimp::output() for full tables)\n")
-  cat("----------------------------------------------------------------\n")
-  out <- utils::capture.output(rblimp::output(x$fit))
-  cat(paste(head(out, 25), collapse = "\n"), "\n")
-  invisible(x)
-}
+# Accept either wrapper object or raw blimp_obj
+.get_blimp_fit <- function(obj) if (!is.null(obj$fit)) obj$fit else obj
 
-# Extract the last reported PSR row's final value (highest PSR in the last block)
-blimp_last_psr <- function(fit_obj) {
-  out <- utils::capture.output(rblimp::output(fit_obj))
-  idx <- grep("^\\s*5001 to 10000|^\\s*\\d+ to \\d+\\s+\\d+\\.\\d+\\s+\\d+\\s*$", out)
-  if (!length(idx)) {
-    # fallback: find all PSR rows and take the last numeric
-    idx <- grep("\\bHighest PSR\\b", out)
-    if (!length(idx)) return(NA_real_)
-    line <- out[max(idx)]
-  } else {
-    line <- out[max(idx)]
-  }
-  # pull the first number that looks like a PSR (e.g., 1.029)
-  num <- as.numeric(regmatches(line, regexpr("\\d+\\.\\d+", line)))
-  num
-}
-
-# Print only the PSR block (burn-in PSR through just before "METROPOLIS-HASTINGS...")
 blimp_print_psr <- function(obj) {
-  # Accept wrapper or raw blimp_obj
-  bl <- if (inherits(obj, "blimp_wrap_fit")) obj$fit else obj
-  out <- utils::capture.output(rblimp::output(bl))
-  
-  s <- grep("^\\s*BURN-IN POTENTIAL SCALE REDUCTION", out, ignore.case = TRUE)
-  e <- grep("^\\s*METROPOLIS-HASTINGS ACCEPTANCE RATES", out, ignore.case = TRUE)
-  
-  if (!length(s)) {
+  fit <- .get_blimp_fit(obj)
+  out <- utils::capture.output(rblimp::output(fit))
+
+  start <- grep("^\\s*BURN-IN POTENTIAL SCALE REDUCTION \\(PSR\\) OUTPUT:", out)
+  if (!length(start)) {
     cat("PSR section not found.\n")
     return(invisible())
   }
-  if (!length(e)) e <- length(out) + 1L  # print to end if we don't find MH header
-  
-  cat(paste(out[s:(e[1] - 1L)], collapse = "\n"), "\n")
+  stop1 <- grep("^\\s*METROPOLIS-HASTINGS ACCEPTANCE RATES", out)
+  stop2 <- grep("^\\s*$", out)
+  stops <- c(stop1[1], stop2[stop2 > start[1]][1], length(out))
+  end <- min(stops[is.finite(stops)], na.rm = TRUE)
+  cat(paste(out[start[1]:end], collapse = "\n"), "\n")
 }
 
-# Print focal model block only (from "Outcome Variable: <y>" up to before auxiliary.model block
-# or before the next "Outcome Variable:" heading, whichever comes first)
 blimp_print_focal <- function(obj) {
-  # Accept wrapper or raw blimp_obj (needs y if wrapper)
-  if (inherits(obj, "blimp_wrap_fit")) {
-    bl <- obj$fit
-    y  <- obj$meta$y
-  } else {
-    stop("Pass the wrapper object (class 'blimp_wrap_fit') so I know the focal outcome name.")
+  fit <- .get_blimp_fit(obj)
+  out <- utils::capture.output(rblimp::output(fit))
+  y <- if (!is.null(obj$meta) && !is.null(obj$meta$y)) obj$meta$y else {
+    m <- regmatches(out, regexpr("^\\s*Outcome Variable:\\s+\\S+", out))
+    if (length(m) && nchar(m[1])) sub("^\\s*Outcome Variable:\\s+", "", m[1]) else ""
   }
-  
-  out <- utils::capture.output(rblimp::output(bl))
+  if (!nchar(y)) {
+    cat("Could not infer focal outcome name.\n")
+    return(invisible())
+  }
   y_esc <- gsub("([][{}()+*.^$|?\\\\])", "\\\\\\1", y, perl = TRUE)
-  
-  # Start at focal outcome header
+
   start <- grep(paste0("^\\s*Outcome Variable:\\s+", y_esc, "\\b"), out)
   if (!length(start)) {
     cat("Focal section not found for outcome '", y, "'.\n", sep = "")
     return(invisible())
   }
-  start <- start[1]
-  
-  # Candidate end markers (first one after 'start' wins)
-  aux_hdr       <- grep("^\\s*auxiliary\\.model block\\s*:\\s*$", out, ignore.case = TRUE)
-  next_outcome  <- setdiff(grep("^\\s*Outcome Variable:\\s+", out, ignore.case = TRUE), start)
-  next_outcome  <- next_outcome[next_outcome > start]
-  predictor_hdr <- grep("^\\s*PREDICTOR MODEL ESTIMATES\\s*:\\s*$", out, ignore.case = TRUE)
-  
-  cand <- c(aux_hdr, next_outcome, predictor_hdr, length(out) + 1L)
-  cand <- cand[cand > start]
-  end  <- if (length(cand)) min(cand) - 1L else length(out)
-  
-  cat(paste(out[start:end], collapse = "\n"), "\n")
+  next_outcome <- grep("^\\s*Outcome Variable:\\s+\\S+", out)
+  next_outcome <- next_outcome[next_outcome > start[1]]
+  pred_est     <- grep("^\\s*PREDICTOR MODEL ESTIMATES:", out)
+  pred_est     <- pred_est[pred_est > start[1]]
+  aux_block    <- grep("^\\s+auxiliary\\.model block:", out)
+
+  candidates <- c(next_outcome[1], pred_est[1], aux_block[1], length(out))
+  end <- min(candidates[is.finite(candidates)], na.rm = TRUE) - 1L
+  if (!is.finite(end) || end < start[1]) end <- length(out)
+
+  cat(paste(out[start[1]:end], collapse = "\n"), "\n")
 }
+
+# ------------------------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------------------------
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
