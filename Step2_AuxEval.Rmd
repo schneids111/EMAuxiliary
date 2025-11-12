@@ -1,0 +1,580 @@
+---
+title: "Evaluating Auxiliary Variables in EMA: Step-by-Step Tutorial"
+author: "Stefan Schneider"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  word_document:
+    toc: true
+    number_sections: true
+---
+
+# Overview
+
+This notebook implements **Step 2** of the *EMAuxiliary Workflow*: evaluating candidate auxiliary variables in EMA data.  
+Auxiliary variables help make the missing-at-random (MAR) assumption more plausible and can reduce bias due to prompt nonresponse.
+
+**What this notebook does**
+1. Data prep for auxiliary variable evaluation: Classify each auxiliary as within-, between-, or mixed-level variables (based on ICC). Decompose and standardize variables into within- and between-person parts.  
+3. Estimate multilevel logistic models predicting missingness 
+4. Compute within- and between-level correlations between auxiliary variables and focal variables. 
+4. Generate a detailed summary table to evaluate auxiliaries.
+4. Rank auxiliaries.
+
+**Output**  
+Produces interactive and static tables summarizing each auxiliary’s predictive utility and conceptual relevance.  
+These results guide the selection of auxiliaries to include in Step 3 (*Modeling with EMAuxiliary*).
+
+**Dependencies**  
+R (≥ 4.2), `dplyr`, `tidyr`, `lme4`, `broom.mixed`, `gt`, `DT`.
+
+For background and installation instructions, see the [README](https://github.com/schneids111/EMAuxiliary-Workflow).
+
+
+```{r setup, include=FALSE}
+# Global chunk options for this tutorial
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+
+# Show warnings immediately as they occur (useful for applied users)
+options(warn = 1)
+
+# Load required packages once here so all chunks have access
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(lme4)
+  library(broom.mixed)
+  library(DT)
+  library(gt)
+})
+```
+
+# Introduction
+
+This tutorial guides you step-by-step through the evaluation of **auxiliary variables** in Ecological Momentary Assessment (EMA) data.  
+Auxiliary variables can improve the plausibility of missing-at-random (MAR) assumptions and reduce bias due to nonresponse.
+
+Each section explains **what to do**, **why it matters**, and **how to interpret the results**.
+
+> **Packages required:**  
+> Install these before running:  
+> `install.packages(c("lme4", "broom.mixed", "dplyr", "tidyr", "gt", "DT"))`
+
+---
+
+## Step 1: Load Your EMA Dataset
+
+**What to do:** Replace the file path below with your own dataset.  
+**Your data must include:**
+- an **ID variable** identifying individuals  
+- a **missingness variable** (1 = missing prompt, 0 = completed prompt)  
+- one or more **candidate auxiliary variables**  
+- one or more **focal variables** from your model of interest
+
+```{r}
+# 🔄 EDIT THIS LINE: Replace with your real dataset path
+# Example:
+# ema_df <- read.csv("your_data.csv")
+```
+
+---
+
+### Optional: Try the Example Dataset (for testing only)
+
+> **If you don’t yet have your data ready**, uncomment and run this section to create a tiny toy dataset.
+> It includes a **pure within** variable (`day_of_study`) and a **pure between** variable (`age`).
+> Remember to **comment this back out** when you switch to your own data.
+
+```{r, eval=FALSE}
+set.seed(123)
+ema_df <- data.frame(
+  id = rep(1:6, each = 5),
+  time_of_day = runif(30, 6, 22),
+  day_of_study = rep(1:5, times = 6),
+  weekend = sample(0:1, 30, replace = TRUE),
+  negative_affect = rnorm(30),
+  physical_activity = rnorm(30),
+  sedentary_behavior = rnorm(30),
+  completion_time = runif(30, 2, 8),
+  prompt_delay = runif(30, 0, 2)
+)
+ema_df$age <- rep(sample(45:75, 6, replace = TRUE), each = 5)
+
+# Small missingness model signal: longer completion_time and weekends increase missingness
+linpred <- (ema_df$completion_time - mean(ema_df$completion_time)) * 0.3 +
+           0.25 * (ema_df$weekend - mean(ema_df$weekend))
+ema_df$missing <- rbinom(30, 1, plogis(linpred))
+
+head(ema_df)
+```
+
+---
+
+## Step 2: Define Your Variables
+
+**What to do:** Insert the column names from your dataset.  
+- `aux_vars`: candidate auxiliaries to screen  
+- `focal_vars`: outcome/predictors from your main model (used for interpretive correlations)  
+- `id_var`: person identifier  
+- `missing_var`: prompt-level missingness indicator (1 = missed prompt)
+
+```{r}
+# 🔄 EDIT THESE NAMES to match your dataset
+aux_vars <- c(
+  "aux1", "aux2", "aux3" )
+
+# Focal variables from your substantive model (e.g., outcome and/or predictors)
+focal_vars <- c("y", "x1")
+
+# Key identifiers
+id_var <- "idn"          # person identifier in your dataset
+missing_var <- "missing" # prompt-level missingness (1 = missing, 0 = completed)
+```
+
+---
+
+## Step 3a: Data Readiness Check
+
+**What this does:** Ensures all required names exist in the dataset.  
+**Why it matters:** Prevents cryptic errors later (e.g., misspellings or missing columns).
+
+```{r data_check, message=TRUE, warning=TRUE}
+# 1) Verify dataset
+if (!exists("ema_df")) {
+  stop("❌ Dataset 'ema_df' not found. Please load or create it in Step 1 before proceeding.")
+}
+ema_df <- as.data.frame(ema_df)
+
+# 2) Verify ID and missingness
+if (!(id_var %in% names(ema_df))) {
+  stop(paste0("❌ The ID variable '", id_var, "' was not found in ema_df."))
+}
+if (!(missing_var %in% names(ema_df))) {
+  stop(paste0("❌ The missingness variable '", missing_var, "' was not found in ema_df."))
+}
+
+# 3) Check auxiliaries
+missing_aux <- setdiff(aux_vars, names(ema_df))
+if (length(missing_aux) > 0) {
+  msg <- paste0("⚠️ The following auxiliary variable(s) were not found in ema_df and will be skipped: ",
+                paste(missing_aux, collapse = ", "))
+  cat("\n", msg, "\n")
+  warning(msg, call. = FALSE)
+  aux_vars <- intersect(aux_vars, names(ema_df))
+}
+
+# 4) Check focal variables
+missing_focal <- setdiff(focal_vars, names(ema_df))
+if (length(missing_focal) > 0) {
+  msg <- paste0("⚠️ The following focal variable(s) were not found in ema_df and will be skipped: ",
+                paste(missing_focal, collapse = ", "))
+  cat("\n", msg, "\n")
+  warning(msg, call. = FALSE)
+  focal_vars <- intersect(focal_vars, names(ema_df))
+}
+
+# 5) Summary message
+message("✅ Data readiness check completed successfully.")
+message("  • Dataset dimensions: ", nrow(ema_df), " rows × ", ncol(ema_df), " columns")
+message("  • ID variable: ", id_var)
+message("  • Missingness variable: ", missing_var)
+message("  • Auxiliary variables (", length(aux_vars), "): ", paste(aux_vars, collapse = ", "))
+message("  • Focal variables (", length(focal_vars), "): ", paste(focal_vars, collapse = ", "))
+```
+
+---
+
+## Step 3b: Compute ICCs for Each Auxiliary
+
+**What this does:** Quantifies each auxiliary’s between-person proportion of variance.  
+**Why it matters:** We classify auxiliaries as `pure_within` (ICC < .05), `pure_between` (ICC > .95), or `mixed`.
+
+```{r}
+icc_df <- data.frame()
+
+for (var in aux_vars) {
+  if (!var %in% names(ema_df)) next
+
+  df_icc <- ema_df %>%
+    dplyr::group_by(!!rlang::sym(id_var)) %>%
+    dplyr::summarize(
+      grp_mean = mean(.data[[var]], na.rm = TRUE),
+      grp_var  = var(.data[[var]],  na.rm = TRUE)
+    ) %>%
+    dplyr::ungroup()
+
+  var_between <- var(df_icc$grp_mean, na.rm = TRUE)
+  var_within  <- mean(df_icc$grp_var, na.rm = TRUE)
+  icc_val     <- var_between / (var_between + var_within)
+
+  icc_df <- rbind(icc_df, data.frame(variable = var, ICC = icc_val))
+}
+
+ema_icc <- icc_df %>%
+  dplyr::mutate(
+    ICC = round(ICC, 3),
+    classification = dplyr::case_when(
+      ICC > .95 ~ "pure_between",
+      ICC < .05 ~ "pure_within",
+      TRUE      ~ "mixed"
+    )
+  )
+
+ema_icc
+```
+
+---
+
+## Step 4: Center and Standardize Auxiliaries
+
+**What this does:** Splits each auxiliary into within-person (WP) and between-person (PM) parts and standardizes them.  
+**Why it matters:** Multilevel models need correctly separated components to avoid conflating within- and between-person effects.
+
+```{r}
+safe_sd <- function(x) if (all(is.na(x))) NA_real_ else sd(x, na.rm = TRUE)
+
+for (var in aux_vars) {
+  # Create person-mean and within-person deviations
+  ema_df <- ema_df %>%
+    dplyr::group_by(!!rlang::sym(id_var)) %>%
+    dplyr::mutate(
+      !!rlang::sym(paste0(var, "_PM")) := mean(.data[[var]], na.rm = TRUE),
+      !!rlang::sym(paste0(var, "_WP")) := .data[[var]] - mean(.data[[var]], na.rm = TRUE)
+    ) %>%
+    dplyr::ungroup()
+
+  # Standardize safely (leave NA when variance is zero)
+  wp <- ema_df[[paste0(var, "_WP")]]
+  pm <- ema_df[[paste0(var, "_PM")]]
+
+  sd_wp <- safe_sd(wp)
+  sd_pm <- safe_sd(pm)
+
+  ema_df[[paste0(var, "_WP_z")]] <- if (!is.na(sd_wp) && sd_wp > 0) as.numeric(scale(wp)) else rep(NA_real_, nrow(ema_df))
+  ema_df[[paste0(var, "_PM_z")]] <- if (!is.na(sd_pm) && sd_pm > 0) as.numeric(scale(pm)) else rep(NA_real_, nrow(ema_df))
+}
+```
+
+---
+
+## Step 5: Predict Missingness (Multilevel Logistic Models)
+
+**What this does:** For each auxiliary, estimates how strongly it predicts missingness at WP and/or PM level.  
+**Output:** Odds ratios (OR) by level.
+
+```{r}
+logit_results <- data.frame()
+
+for (var in aux_vars) {
+  wp_col <- paste0(var, "_WP_z")
+  pm_col <- paste0(var, "_PM_z")
+
+  df_sub <- ema_df %>%
+    dplyr::filter(!is.na(.data[[missing_var]]) & (!is.na(.data[[wp_col]]) | !is.na(.data[[pm_col]])))
+
+  if (nrow(df_sub) < 20) {
+    warning(paste("Skipping", var, "- fewer than 20 usable rows."))
+    next
+  }
+
+  rhs <- c()
+  if (any(!is.na(df_sub[[wp_col]]))) rhs <- c(rhs, wp_col)
+  if (any(!is.na(df_sub[[pm_col]]))) rhs <- c(rhs, pm_col)
+
+  # Random intercept by person
+  fml <- reformulate(termlabels = c(rhs, paste0("(1|", "`", id_var, "`", ")")), response = missing_var)
+
+  model <- tryCatch(lme4::glmer(fml, data = df_sub, family = binomial, nAGQ = 0),
+                    error = function(e) NULL)
+
+  if (!is.null(model)) {
+    ests <- broom.mixed::tidy(model, effects = "fixed")
+    ests <- ests[ests$term != "(Intercept)", ]
+    ests$level <- ifelse(grepl("_WP_z$", ests$term), "within", "between")
+    ests$variable <- var
+    ests$OR <- exp(ests$estimate)
+    logit_results <- rbind(logit_results, ests[, c("variable","level","OR")])
+  }
+}
+```
+
+---
+
+## Step 6: Correlate Auxiliaries with Focal Variables
+
+**What this does:** Computes signed **within-** and **between-person** correlations of each auxiliary with each focal variable.  
+**Why it matters:** Auxiliaries useful for imputation should relate meaningfully to model variables.
+
+```{r}
+cor_results <- data.frame()
+
+for (aux in aux_vars) {
+  if (!aux %in% names(ema_df)) {
+    warning(paste("Variable", aux, "not found; skipping."))
+    next
+  }
+
+  for (foc in focal_vars) {
+    if (!foc %in% names(ema_df)) {
+      warning(paste("Variable", foc, "not found; skipping."))
+      next
+    }
+
+    x_aux <- suppressWarnings(as.numeric(ema_df[[aux]]))
+    x_foc <- suppressWarnings(as.numeric(ema_df[[foc]]))
+    g     <- as.vector(ema_df[[id_var]])
+
+    df_sub <- data.frame(aux = x_aux, foc = x_foc, g = g)
+    df_sub <- df_sub[!is.na(df_sub$aux) & !is.na(df_sub$foc), ]
+
+    if (nrow(df_sub) == 0) {
+      warning(paste("No valid data for pair", aux, "and", foc, "; skipping."))
+      next
+    }
+
+    # Within-person correlation (de-mean by person)
+    aux_WP <- df_sub$aux - ave(df_sub$aux, df_sub$g, FUN = mean, na.rm = TRUE)
+    foc_WP <- df_sub$foc - ave(df_sub$foc, df_sub$g, FUN = mean, na.rm = TRUE)
+    cor_w  <- suppressWarnings(cor(aux_WP, foc_WP, use = "pairwise"))
+
+    # Between-person correlation (person means)
+    df_bp <- aggregate(cbind(aux = df_sub$aux, foc = df_sub$foc), by = list(df_sub$g), FUN = mean, na.rm = TRUE)
+    cor_b <- suppressWarnings(cor(df_bp$aux, df_bp$foc, use = "pairwise"))
+
+    cor_results <- rbind(
+      cor_results,
+      data.frame(variable = aux, level = "within",  focal_var = foc, correlation = cor_w),
+      data.frame(variable = aux, level = "between", focal_var = foc, correlation = cor_b)
+    )
+  }
+}
+```
+
+---
+
+## Step 7: Interactive Detailed Table 
+
+**What this shows:**
+Each auxiliary variable appears once per level (within and/or between).
+Pure **within-person** variables appear only with Level = “within.”
+Pure **between-person** variables appear only with Level = “between.”
+**Mixed** variables appear twice, once per level.
+Columns show the variable’s association with **missingness (OR)** and with each **focal variable (correlations r)**.
+
+```{r}
+# 1) Merge correlation and logistic results
+detailed_df <- cor_results %>%
+  dplyr::left_join(logit_results, by = c("variable", "level")) %>%
+  dplyr::left_join(ema_icc, by = "variable")
+
+# 2) Mask irrelevant level-components based on ICC classification
+detailed_df <- detailed_df %>%
+  dplyr::mutate(
+    OR = dplyr::if_else(classification == "pure_within"  & level == "between", NA_real_, OR),
+    OR = dplyr::if_else(classification == "pure_between" & level == "within",  NA_real_, OR),
+    correlation = dplyr::if_else(classification == "pure_within"  & level == "between", NA_real_, correlation),
+    correlation = dplyr::if_else(classification == "pure_between" & level == "within",  NA_real_, correlation)
+  )
+
+# 3) Pivot correlations so focal variables become side-by-side columns
+wide_cor <- detailed_df %>%
+  dplyr::select(variable, level, focal_var, correlation) %>%
+  tidyr::pivot_wider(
+    names_from = focal_var,
+    values_from = correlation,
+    names_glue = "{focal_var}_r"
+  )
+
+# 4) Merge ORs and keep only relevant info (no ICC/classification)
+wide_combined <- wide_cor %>%
+  dplyr::left_join(
+    detailed_df %>%
+      dplyr::select(variable, level, OR) %>%
+      dplyr::distinct(),
+    by = c("variable", "level")
+  ) %>%
+  dplyr::select(variable, level, OR, dplyr::everything()) %>%
+  dplyr::mutate(
+    OR  = round(OR, 3),
+    dplyr::across(dplyr::matches("_r$"), ~ round(.x, 3))
+  )
+
+# 5) Drop level-rows where all numeric columns are NA
+wide_combined <- wide_combined %>%
+  dplyr::filter(rowSums(!is.na(dplyr::select(., where(is.numeric)))) > 0)
+
+# 6) Tidy up labels and order
+wide_combined <- wide_combined %>%
+  dplyr::arrange(variable, dplyr::desc(level)) %>%
+  dplyr::rename(
+    `Auxiliary Variable` = variable,
+    `Level` = level,
+    `Missingness (OR)` = OR
+  )
+
+# 7) Display interactive datatable
+DT::datatable(
+  wide_combined,
+  extensions = "Scroller",
+  options = list(
+    pageLength = 50,
+    scrollX = TRUE,
+    deferRender = TRUE,
+    dom = 'tip',
+    columnDefs = list(list(className = 'dt-center', targets = "_all"))
+  ),
+  caption = htmltools::tags$caption(
+    style = 'caption-side: top; text-align: left;',
+    htmltools::tags$strong("Detailed overview of auxiliary variables by level."),
+    htmltools::tags$br(),
+    "Each variable appears once per relevant level (within and/or between).",
+    htmltools::tags$br(),
+    "Columns show odds ratios (OR) for missingness and correlations (r) with each focal variable."
+  )
+)
+
+```
+
+---
+
+## Step 8: Compute Summary Metrics and Rank Auxiliaries
+
+**Goal:** Provide a **single overview table** for applied users.  
+- Convert ORs to **r-equivalent** effect sizes to put logistic and correlation results on a comparable metric.  
+- Use ICC classification to **select only the relevant level(s)** per auxiliary.  
+- Compute a **composite score** (mean of the two metrics) and **rank** auxiliaries.
+
+**Note: weights for associations with missingness and associations with model variables can be adjusted below. The default is equal weights.
+```{r}
+# ---- User-adjustable weights ----
+weight_missingness <- 1/2     # e.g., set to 0.67 to emphasize missingness predictors
+weight_correlations <- 1/2    # complement weight (must sum to 1 for equal scaling)
+
+# Helper: convert odds ratio to r-equivalent effect size
+to_r_from_logOR <- function(OR) {
+  logOR <- log(OR)
+  d     <- logOR * sqrt(3) / pi
+  r     <- d / sqrt(d^2 + 4)
+  return(r)
+}
+
+# 1) Mean |r|-equivalent from ORs, by level
+miss_by_level <- logit_results %>%
+  dplyr::mutate(r_equiv = to_r_from_logOR(OR)) %>%
+  dplyr::group_by(variable, level) %>%
+  dplyr::summarize(mean_abs_r_from_OR = mean(abs(r_equiv), na.rm = TRUE), .groups = "drop")
+
+# 2) Mean |r| correlations, by level (across focal vars)
+cor_by_level <- cor_results %>%
+  dplyr::group_by(variable, level) %>%
+  dplyr::summarize(mean_abs_r = mean(abs(correlation), na.rm = TRUE), .groups = "drop")
+
+# 3) Pivot wide to have within/between columns
+miss_wide <- miss_by_level %>%
+  tidyr::pivot_wider(names_from = level, values_from = mean_abs_r_from_OR, names_prefix = "OR_r_")
+
+cor_wide <- cor_by_level %>%
+  tidyr::pivot_wider(names_from = level, values_from = mean_abs_r, names_prefix = "corr_")
+
+# 4) Combine and join ICCs
+summary_lvl <- dplyr::full_join(miss_wide, cor_wide, by = "variable") %>%
+  dplyr::left_join(ema_icc, by = "variable")
+
+# 5) Level-aware pooling per classification
+summary_lvl <- summary_lvl %>%
+  dplyr::mutate(
+    pooled_abs_r_from_OR = dplyr::case_when(
+      classification == "pure_within"  ~ OR_r_within,
+      classification == "pure_between" ~ OR_r_between,
+      classification == "mixed"        ~ rowMeans(cbind(OR_r_within, OR_r_between), na.rm = TRUE),
+      TRUE                             ~ rowMeans(cbind(OR_r_within, OR_r_between), na.rm = TRUE)
+    ),
+    pooled_abs_r = dplyr::case_when(
+      classification == "pure_within"  ~ corr_within,
+      classification == "pure_between" ~ corr_between,
+      classification == "mixed"        ~ rowMeans(cbind(corr_within, corr_between), na.rm = TRUE),
+      TRUE                             ~ rowMeans(cbind(corr_within, corr_between), na.rm = TRUE)
+    )
+  )
+
+# 6) Weighted composite score 
+summary_lvl <- summary_lvl %>%
+  mutate(
+    weight_denom = (
+      weight_missingness * as.numeric(!is.na(pooled_abs_r_from_OR)) +
+      weight_correlations * as.numeric(!is.na(pooled_abs_r))
+    ),
+    overall_score = if_else(
+      weight_denom > 0,
+      (weight_missingness * pooled_abs_r_from_OR +
+         weight_correlations * pooled_abs_r) / weight_denom,
+      NA_real_
+    )
+  )
+# ---- 7. Three separate rank orders ----
+summary_lvl <- summary_lvl %>%
+  dplyr::mutate(
+    rank_missingness = rank(-pooled_abs_r_from_OR, na.last = "keep"),
+    rank_correlation  = rank(-pooled_abs_r,        na.last = "keep"),
+    rank_combined     = rank(-overall_score,       na.last = "keep")
+  )
+```
+
+---
+
+## Step 9: Summary Ranking Table (gt)
+
+**What this shows:** A compact overview with **(a)** mean |r|-equivalent from ORs, **(b)** mean |r| with focal variables, and **(c)** the composite score and rank.  
+**How to use:** This is **descriptive guidance**. Combine with **conceptual relevance** and **complementarity** when selecting auxiliaries.
+
+```{r}
+summary_lvl %>%
+  dplyr::transmute(
+    variable,
+    classification,
+    `Mean |r| from Missingness (logistic)` = round(pooled_abs_r_from_OR, 3),
+    `Mean |r| with Focal Vars`             = round(pooled_abs_r, 3),
+    `Composite Score`                      = round(overall_score, 3),
+    `Rank: Missingness`                    = rank_missingness,
+    `Rank: Correlation`                    = rank_correlation,
+    `Rank: Combined`                       = rank_combined
+  ) %>%
+  dplyr::arrange(`Rank: Combined`) %>%
+  gt::gt() %>%
+  gt::fmt_number(
+    columns = c(`Mean |r| from Missingness (logistic)`,
+                `Mean |r| with Focal Vars`,
+                `Composite Score`),
+    decimals = 3
+  ) %>%
+  gt::tab_header(
+    title = gt::md("**Auxiliary Variable Ranking Summary**"),
+    subtitle = gt::md("Three complementary ranks: Missingness, Correlation, and Combined (equal weighting).")
+  ) %>%
+  gt::tab_footnote(
+    footnote = "Ranks are descriptive only; include auxiliaries based on conceptual relevance and complementarity."
+  )
+```
+
+---
+
+# Wrap-Up
+
+You now have two complementary views:
+
+1. **Interactive detailed table** — Explore ORs and signed correlations for each auxiliary × focal combination, with within/between side by side.  
+2. **Summary ranking table** — Prioritize auxiliaries by combined statistical evidence on a common r-scale, using level-aware pooling informed by ICCs.
+
+Use both quantitative evidence **and** conceptual reasoning when deciding which auxiliaries to include.  
+The goal is to capture variables that meaningfully explain the missingness process and align with your substantive model.
+
+---
+
+## Appendix: Troubleshooting Tips
+
+- If you see warnings in **Step 3a**, double-check variable names in **Step 2**.  
+- If a variable is **pure_within** (ICC < .05), between-level entries are set to `NA` by design.  
+- If a variable is **pure_between** (ICC > .95), within-level entries are set to `NA` by design.  
+- Logistic models in **Step 5** require at least ~20 usable rows per auxiliary; otherwise they are skipped.
