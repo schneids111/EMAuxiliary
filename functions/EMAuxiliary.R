@@ -96,23 +96,23 @@
 # ------------------------------------------------------------------------------
 
 EMAuxiliary <- function(
-  formula,
-  data,
-  id,
-  aux = NULL,
-  ordinal = NULL,
-  nominal = NULL,
-  center_group = NULL,   # variables to group-mean center (enables x.mean)
-  center_grand = NULL,   # variables to grand-mean center (not related to .mean)
-  burn = 5000,
-  iter = 10000,
-  chains = 2,
-  seed = 12345
+    formula,
+    data,
+    id,
+    aux = NULL,
+    ordinal = NULL,
+    nominal = NULL,
+    center_group = NULL,   # variables to group-mean center (enables x.mean)
+    center_grand = NULL,   # variables to grand-mean center (not related to .mean)
+    burn = 5000,
+    iter = 10000,
+    chains = 2,
+    seed = 12345
 ) {
   stopifnot(is.data.frame(data))
   if (!requireNamespace("lme4", quietly = TRUE)) stop("Install lme4.")
   if (!requireNamespace("rblimp", quietly = TRUE)) stop("Install rblimp.")
-
+  
   # Fixed part and random part
   fixed_form <- lme4::nobars(formula)
   fb         <- lme4::findbars(formula)      # random terms
@@ -124,22 +124,22 @@ EMAuxiliary <- function(
     })))
     rand_slopes <- setdiff(inside_terms, "1")
   }
-
+  
   # Outcome name
   y <- deparse(formula[[2L]])
-
+  
   # ---------------- Build RHS with .mean validation ---------------------------
-
+  
   # Raw term labels with ":" to split later; keep as-is
   tl_raw <- attr(stats::terms(fixed_form), "term.labels")
   tl_raw <- tl_raw[nzchar(tl_raw)]
   rhs_tokens_colon <- .tokens_from_terms(tl_raw)
-
+  
   # Split interactions into atomic bits to find any *.mean in use
   rhs_atoms <- unique(unlist(strsplit(rhs_tokens_colon, ":", fixed = TRUE)))
   rhs_atoms <- rhs_atoms[nzchar(rhs_atoms)]
   means_in_rhs <- unique(sub("\\.mean$", "", rhs_atoms[grepl("\\.mean$", rhs_atoms)]))
-
+  
   # Validation: every base that appears as *.mean must be in center_group (or be y)
   cg_allow <- unique(c(center_group, y)) # y.mean is allowed even if user didn't list it
   cg_allow <- cg_allow[!is.na(cg_allow) & nzchar(cg_allow)]
@@ -152,14 +152,14 @@ EMAuxiliary <- function(
       call. = FALSE
     )
   }
-
+  
   # Now produce the '*' BLIMP RHS tokens
   blimp_terms <- if (length(rhs_tokens_colon)) gsub(":", "*", rhs_tokens_colon, fixed = TRUE) else character(0)
   rhs_tokens  <- unique(blimp_terms)
   fixed_rhs   <- if (length(rhs_tokens)) paste(rhs_tokens, collapse = " ") else "1"
-
+  
   # ---------------- Random slopes: forbid ordinal/nominal and *.mean ----------
-
+  
   slope_vars <- rand_slopes
   if (length(slope_vars)) {
     # strip possible ".mean" if someone wrote it (random slopes must be L1)
@@ -173,9 +173,9 @@ EMAuxiliary <- function(
            paste(bad_on_slopes, collapse = ", "))
     }
   }
-
+  
   # ---------------- Build CENTER blocks --------------------------------------
-
+  
   # We pass exactly what the user requested for predictors:
   # - center_group → groupmean
   # - center_grand → grandmean
@@ -185,39 +185,39 @@ EMAuxiliary <- function(
   center_group_to_pass <- center_group_to_pass[!is.na(center_group_to_pass) & nzchar(center_group_to_pass)]
   center_grand_to_pass <- unique(center_grand)
   center_grand_to_pass <- center_grand_to_pass[!is.na(center_grand_to_pass) & nzchar(center_grand_to_pass)]
-
+  
   center_lines <- character(0)
   if (length(center_group_to_pass))
     center_lines <- c(center_lines, paste0("groupmean = ", paste(center_group_to_pass, collapse = " ")))
   if (length(center_grand_to_pass))
     center_lines <- c(center_lines, paste0("grandmean = ", paste(center_grand_to_pass, collapse = " ")))
   center_block <- if (length(center_lines)) paste0("CENTER: ", paste(center_lines, collapse = "; "), ";") else NULL
-
+  
   # ---------------- Auxiliary model construction ------------------------------
-
+  
   # Base predictors (no interactions): their raw names (strip .mean suffix)
   base_preds <- .base_terms_from_formula(formula)
-
+  
   # Determine L1 vs L2 for auxiliaries
   aux <- aux %||% character(0)
   aux <- unique(aux[nzchar(aux)])
-
+  
   # ICC and "near pure L1" test: ICC < .05
   aux_icc <- setNames(rep(NA_real_, length(aux)), aux)
   for (a in aux) {
     if (a %in% names(data)) aux_icc[a] <- .icc_est(data[[a]], data[[id]])
   }
   near_L1 <- names(aux_icc)[which(is.finite(aux_icc) & aux_icc < 0.05)]
-
+  
   # Predictor pools for aux RHS:
   # Mixed-level aux → use full RHS (including interactions) + y + y.mean
   full_rhs_for_aux <- rhs_tokens_colon
   # L1-only aux (near_L1) → y + base x’s only (no .mean)
   # Pure L2 aux → y.mean + L2 predictors / means of mixed predictors
-
+  
   # Helper to detect if an aux is L2-only
   aux_is_L2 <- function(a) .is_level2_var(a, data, id)
-
+  
   # Build RHS per aux variable
   aux_lines <- character(0)
   for (a in aux) {
@@ -236,14 +236,14 @@ EMAuxiliary <- function(
       rhs <- rhs[nzchar(rhs)]
       if (length(rhs))
         aux_lines <- c(aux_lines, paste0(a, " ~ ", paste(rhs, collapse = " "), ";"))
-
+      
     } else if (a %in% near_L1) {
       # Near pure L1 aux: only y and base x’s (no .mean, no interactions)
       rhs <- unique(c(y, base_preds))
       rhs <- rhs[rhs != a & nzchar(rhs)]
       if (length(rhs))
         aux_lines <- c(aux_lines, paste0(a, " ~ ", paste(rhs, collapse = " "), ";"))
-
+      
     } else {
       # Mixed-level aux: y + y.mean + full focal RHS (incl. interactions)
       rhs <- unique(c(y, paste0(y, ".mean"), full_rhs_for_aux))
@@ -252,20 +252,20 @@ EMAuxiliary <- function(
         aux_lines <- c(aux_lines, paste0(a, " ~ ", paste(rhs, collapse = " "), ";"))
     }
   }
-
+  
   aux_block <- if (length(aux_lines)) paste0("auxiliary.model:\n  ", paste(aux_lines, collapse = "\n  ")) else NULL
   aux_model_arg <- if (length(aux_lines)) paste(aux_lines, collapse = "\n  ") else NULL
-
+  
   # ---------------- VARIABLES list (observed only) ----------------------------
-
+  
   # All variables referenced as observed in BLIMP (exclude .mean tokens)
   rhs_observed_atoms <- unique(unlist(strsplit(rhs_tokens_colon, ":", fixed = TRUE)))
   rhs_observed_bases <- unique(sub("\\.mean$", "", rhs_observed_atoms))
   all_vars <- unique(c(id, y, rhs_observed_bases, aux, ordinal, nominal))
   all_vars <- all_vars[nzchar(all_vars)]
-
+  
   # ---------------- Auto-standardize continuous auxiliaries -------------------
-
+  
   data_run <- data
   cont_aux <- aux[aux %in% names(data_run)]
   # avoid scaling ordinal/nominal auxiliaries
@@ -280,15 +280,15 @@ EMAuxiliary <- function(
     }
     data_run <- std_res$data
   }
-
+  
   # ---------------- Compose BLIMP code (for printing only) --------------------
-
+  
   model_line <- if (!length(slope_vars)) {
     paste0("MODEL:\n  ", y, " ~ ", fixed_rhs, ";")
   } else {
     paste0("MODEL:\n  ", y, " ~ ", fixed_rhs, " | ", paste(slope_vars, collapse = " "), ";")
   }
-
+  
   blimp_code <- paste(
     "DATA: <in-memory by rblimp>;",
     paste0("VARIABLES: ", paste(all_vars, collapse = " "), ";"),
@@ -304,13 +304,15 @@ EMAuxiliary <- function(
     paste0("CHAINS: ", chains, ";"),
     sep = "\n"
   )
-
+  
   # ---------------- Run BLIMP -------------------------------------------------
-
+  
+  # Build args list
   args <- list(
     data      = data_run,
     clusterid = id,
-    model     = paste0(y, " ~ ", fixed_rhs, if (length(slope_vars)) paste0(" | ", paste(slope_vars, collapse = " ")) else ""),
+    model     = paste0(y, " ~ ", fixed_rhs,
+                       if (length(slope_vars)) paste0(" | ", paste(slope_vars, collapse = " ")) else ""),
     seed      = seed,
     burn      = burn,
     iter      = iter,
@@ -326,43 +328,35 @@ EMAuxiliary <- function(
   }
   if (length(ordinal %||% character(0))) args$ordinal <- paste(ordinal, collapse = " ")
   if (length(nominal %||% character(0))) args$nominal <- paste(nominal, collapse = " ")
-
-  # pass auxiliary model through a recognized arg name if available
+  
+  # Try to pass auxiliaries as a dedicated argument if your rblimp supports it.
+  # Otherwise, inline the block into the model string.
+  fm_names <- names(formals(rblimp::rblimp))
   if (!is.null(aux_model_arg)) {
-    fm <- names(formals(rblimp::rblimp))
-    aux_names <- c("auxiliary.model", "auxmodel", "auxiliarymodel", "auxiliary")
-    matched <- intersect(aux_names, fm)
+    possible_aux_names <- c("auxiliary.model", "auxmodel", "auxiliarymodel", "auxiliary")
+    matched <- intersect(possible_aux_names, fm_names)
     if (length(matched)) {
       args[[matched[1]]] <- aux_model_arg
     } else {
-      # inline fallback
+      # Inline fallback
       args$model <- paste0(args$model, ";\nauxiliary.model:\n  ", aux_model_arg, ";")
     }
   }
-
-  fit <- rblimp::rblimp(
-    data      = args$data,
-    clusterid = args$clusterid,
-    model     = args$model,
-    seed      = args$seed,
-    burn      = args$burn,
-    iter      = args$iter,
-    chains    = args$chains,
-    center    = args$center %||% NULL,
-    ordinal   = args$ordinal %||% NULL,
-    nominal   = args$nominal %||% NULL,
-    `auxiliary.model` = args[["auxiliary.model"]] %||% NULL
-  )
-
+  
+  # Drop NULL entries and any names not in formals (older rblimp builds)
+  args <- args[!vapply(args, is.null, logical(1))]
+  args <- args[names(args) %in% fm_names]
+  
+  fit <- do.call(rblimp::rblimp, args)
+  
   # ---------------- PSR + scale audit (only if PSR > 1.05) -------------------
-
+  
   psr <- tryCatch(.blimp_last_psr(fit), error = function(e) NA_real_)
   if (is.finite(psr) && psr > 1.05) {
     header <- sprintf(
       "Final PSR is %.3f. The final PSR should be < 1.05.\nResults may be unreliable. Consider longer burn/iter, more chains, or simplifying auxiliaries.\n",
       psr
     )
-    # scale audit on focal variables (y + base predictors)
     base_preds_for_audit <- base_preds[base_preds %in% names(data)]
     focal_cols <- unique(c(y, base_preds_for_audit))
     sds <- vapply(focal_cols, function(v) .safe_sd(data[[v]]), numeric(1))
@@ -387,7 +381,7 @@ EMAuxiliary <- function(
     }
     warning(paste0(header, if (!is.null(addendum)) paste0("\n", addendum) else ""), call. = FALSE)
   }
-
+  
   # Return
   structure(
     list(
@@ -409,7 +403,7 @@ EMAuxiliary <- function(
 blimp_print_psr <- function(obj) {
   fit <- .get_blimp_fit(obj)
   out <- utils::capture.output(rblimp::output(fit))
-
+  
   start <- grep("^\\s*BURN-IN POTENTIAL SCALE REDUCTION \\(PSR\\) OUTPUT:", out)
   if (!length(start)) {
     cat("PSR section not found.\n")
@@ -434,7 +428,7 @@ blimp_print_focal <- function(obj) {
     return(invisible())
   }
   y_esc <- gsub("([][{}()+*.^$|?\\\\])", "\\\\\\1", y, perl = TRUE)
-
+  
   start <- grep(paste0("^\\s*Outcome Variable:\\s+", y_esc, "\\b"), out)
   if (!length(start)) {
     cat("Focal section not found for outcome '", y, "'.\n", sep = "")
@@ -445,11 +439,11 @@ blimp_print_focal <- function(obj) {
   pred_est     <- grep("^\\s*PREDICTOR MODEL ESTIMATES:", out)
   pred_est     <- pred_est[pred_est > start[1]]
   aux_block    <- grep("^\\s+auxiliary\\.model block:", out)
-
+  
   candidates <- c(next_outcome[1], pred_est[1], aux_block[1], length(out))
   end <- min(candidates[is.finite(candidates)], na.rm = TRUE) - 1L
   if (!is.finite(end) || end < start[1]) end <- length(out)
-
+  
   cat(paste(out[start[1]:end], collapse = "\n"), "\n")
 }
 
