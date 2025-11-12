@@ -11,9 +11,9 @@ This repository accompanies the paper:
 
 | Step | Purpose | Output / Next Input |
 |------|----------|---------------------|
-| **Step 1 – Prepare EMA Data** (`Step1_PrepareEMA.Rmd`) | Create a complete long-format EMA dataset where each scheduled prompt—completed or missed—is represented. Add lagged variables, within-person centering, and person-level summaries. | `ema_prepared.csv` |
-| **Step 2 – Evaluate Auxiliary Variables** (`Step2_EvaluateAux.Rmd`) | Identify, classify, and rank potential auxiliary variables based on ICCs, prediction of missingness, and correlations with focal variables. | ranked table of auxiliary variables |
-| **Step 3 – Fit Models with EMAuxiliary** (`functions/EMAuxiliary.R`) | Incorporate selected auxiliaries into multivariate multilevel models in **Blimp**. Handles latent centering, variable typing, and Bayesian convergence diagnostics automatically. | full Blimp output and model estimates |
+| **Step 1 – Prepare EMA Data** (`Step1_EMA_DataPrep.Rmd`) | Helps create a complete long-format EMA dataset where each scheduled prompt—completed or missed—is represented. Add lagged variables, within-person centering, and person-level summaries. | `ema_prepared.csv` |
+| **Step 2 – Evaluate Auxiliary Variables** (`Step2_AuxEval.Rmd`) | Evaluate and rank potential auxiliary variables based on prediction of missingness and correlations with focal variables. | ranked table of auxiliary variables |
+| **Step 3 – Fit Models with EMAuxiliary** (`functions/EMAuxiliary.R`) | Incorporate selected auxiliaries into multilevel models in **Blimp**. Handles latent centering, variable typing, and Bayesian convergence diagnostics automatically. | full Blimp output and model estimates |
 
 Each component is fully stand-alone and can be run independently, but the workflow is designed to flow from one step to the next.
 
@@ -30,40 +30,48 @@ Each component is fully stand-alone and can be run independently, but the workfl
 Required R packages:
 dplyr, tidyr, lme4, broom.mixed, gt, DT, lubridate, ggplot2, plotly, data.table, purrr
 
-2. Using the Tutorials
-Step 1: Run the notebook Step1_PrepareEMA.Rmd to reconstruct or simulate your EMA dataset and create ema_prepared.csv.
+### 2. Using the Tutorials
+   
+Step 1: Run relevant pieces of the notebook Step1_EMA_DataPrep.Rmd to reconstruct or simulate your EMA dataset and create ema_prepared.csv.
 
-Step 2: Run Step2_EvaluateAux.Rmd using ema_prepared.csv as input. This will output ranked candidate auxiliaries.
+Step 2: Run Step2_AuxEval.Rmd using ema_prepared.csv as input. This will output ranked candidate auxiliaries.
 
 Step 3: Use the EMAuxiliary() function (located in functions/EMAuxiliary.R) to generate a Blimp model that includes your selected auxiliaries.
 
-📦 Repository Contents
-bash
-Copy code
+## 📦 Repository Contents
 EMAuxiliary-Workflow/
+
 ├── README.md
+
 ├── Step1_PrepareEMA.Rmd
+
 ├── Step2_EvaluateAux.Rmd
+
 ├── functions/
+
 │   └── EMAuxiliary.R
+
 ├── docs/                # optional rendered HTML or Word tutorials
+
 └── data/
+
     └── ema_prepared.csv # example data output (optional)
-📊 Output Examples
+    
+## 📊 Output Examples
 Step 1: compliance summaries and prompt-completion heatmaps
 
 Step 2: interactive ranking table of auxiliary variables
 
 Step 3: Blimp output files (.inp, .out) and model convergence diagnostics (PSR < 1.05)
 
-📎 Citation and Archival Links
-GitHub repository (latest version): https://github.com/YourUser/EMAuxiliary-Workflow
+## 📎 Citation and Archival Links
+GitHub repository (latest version): https://github.com/schneids111/EMAuxiliary-Workflow
 
 Permanent OSF snapshot (DOI): [to be added after upload]
 
 Please cite both GitHub and OSF entries when referencing these materials.
 
-🧠 Contact
+## 🧠 Contact
 For questions, please contact:
-[Your Name, Institution]
-Email: [your.email@institution.edu]
+Stefan Schneider, PhD, University of Southern California
+Email: schneids@usc.edu
