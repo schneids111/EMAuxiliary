@@ -1,0 +1,429 @@
+---
+title: "Step 1 – Preparing the EMA Dataset (Tutorial Final, Extended + Inputs)"
+author: "Stefan Schneider"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+# Overview
+This notebook illustrates **Step 1** of the *EMAauxiliary Workflow*:
+how to prepare an EMA dataset so that every scheduled prompt—completed or missed—
+appears in the data and is accompanied by auxiliary information.
+
+Each section is independent and can be adapted to your own data.
+Code chunks are annotated with **User inputs** and **New variables created**.
+
+**Goal.** To create a complete, long-format dataset that can be used in Step 2 (*Evaluating Auxiliary Variables*) and Step 3 (*Modeling with EMAuxiliary*).  
+**Output.** An optional dataset `ema_prepared.csv` ready for further analysis.  
+For a description of the full three-step workflow, see the [project README](https://github.com/schneids111/EMAuxiliary-Workflow)
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(plotly)
+library(data.table)
+library(purrr)
+set.seed(1234)
+```
+
+---
+
+# Optional Helper: Simulate Example EMA Data
+Creates a runnable toy dataset for demonstration.
+
+```{r helper-function}
+simulate_ema_data <- function(n_id = 10, n_day = 3, n_prom = 6,
+                              mean_mood = 50, mean_stress = 50,
+                              sd_within = 10, missing_rate = 0.3,
+                              seed = 1234) {
+
+  set.seed(seed)
+
+  full <- expand.grid(id = 1:n_id,
+                      day = 1:n_day,
+                      prompt_num = 1:n_prom)
+
+  person_df <- data.frame(
+    id = 1:n_id,
+    age = sample(40:70, n_id, replace = TRUE),
+    gender = sample(c("Male", "Female"), n_id, replace = TRUE)
+  )
+
+  df <- dplyr::left_join(full, person_df, by = "id")
+
+  df <- df %>%
+    dplyr::group_by(id) %>%
+    dplyr::mutate(
+      mood = mean_mood + arima.sim(model = list(ar = 0.4), n = n()) * sd_within,
+      stress = mean_stress + arima.sim(model = list(ar = 0.3), n = n()) * sd_within
+    ) %>%
+    dplyr::ungroup()
+
+  df <- df %>%
+    dplyr::group_by(id, day) %>%
+    dplyr::sample_frac(1 - missing_rate) %>%
+    dplyr::arrange(id, day, prompt_num) %>%
+    dplyr::ungroup()
+
+  # Deterministic times so joins work in this demo
+  df <- df %>%
+    mutate(datetime = make_datetime(year = 2023, month = 1, day = day,
+                                    hour = 8 + 2 * (prompt_num - 1)))
+
+  return(df)
+}
+
+ema_df <- simulate_ema_data(n_id = 5, n_day = 3, n_prom = 6, missing_rate = 0.3)
+head(ema_df)
+```
+
+
+---
+
+# 0  Simulated Example Data  (skip if using your own)
+
+If you have your own EMA dataset, start here.  
+Otherwise, use the simulated data above to follow along.
+
+```{r simulate}
+head(ema_df)
+```
+
+
+---
+
+# 1  Add Rows for Missed Prompts
+
+Reinsert skipped prompts so that each person / day has a complete sequence.
+
+⚠️ **Note.** The exact procedure for reinserting skipped prompts will depend on your EMA design and available data structure.  
+The code examples below are intended as **starting points** that you can adapt for your own dataset.  
+Depending on whether your study used fixed, semi-random, or fully random prompt schedules—and on what information your EMA platform provides—you may need to modify one or more of these steps to match your data.
+
+
+#Option 1: assumes that the dataset includes a variable indicating the prompt numbers as ORIGINALLY SCHEDULED
+
+### **User inputs**
+- `id_var`: participant ID  
+- `group_vars`: grouping variables (e.g., `c("id","day")`)  
+- `prompt_var`: column that orders prompts within group  
+
+### **New variable created**
+- `missed_prompt` (0/1): 1 for prompts inserted by `complete()` (missed), 0 for originally observed prompts.
+
+```{r add-missing-prompts}
+id_var     <- "id"
+group_vars <- c("id", "day")
+prompt_var <- "prompt_num"
+
+# Initially mark observed rows as completed
+ema_df <- ema_df %>%
+  mutate(missed_prompt = 0L)
+
+# Add rows for all scheduled prompts
+ema_df <- ema_df %>%
+  group_by(across(all_of(group_vars))) %>%
+  complete(!!sym(prompt_var) := full_seq(get(prompt_var), 1)) %>%
+  ungroup()
+
+# New rows added by complete() get missed_prompt = 1
+ema_df <- ema_df %>%
+  mutate(missed_prompt = if_else(is.na(missed_prompt), 1L, missed_prompt))
+
+ema_df %>% count(id, day, missed_prompt)
+```
+
+---
+
+#Option 2: assumes the EMA prompts were administered on a FIXED SCHEDULE.
+Irregular Schedules (datetime expansion): For fixed schedules with known expected times, reconstruct the full datetime grid.
+
+### **User inputs**
+- `expected_times_per_day`: vector of expected hours for prompts (length = prompts/day).
+
+### **New variables created**
+- `datetime`: POSIXct timestamp for each expected prompt.  
+- `missed_prompt` (0/1): re-derived based on whether a response exists at that expected time.
+
+```{r irregular}
+expected_times_per_day <- c(8, 10, 12, 14, 16, 18)
+
+# Create a synthetic datetime if none exists
+if (!"datetime" %in% names(ema_df)) {
+  ema_df <- ema_df %>%
+    mutate(datetime = make_datetime(year = 2023, month = 1, day = day,
+                                    hour = 8 + 2 * (prompt_var - 1)))
+  message("No datetime column found — created synthetic timestamps using 2-hour spacing.")
+}
+
+expected_grid <- ema_df %>%
+  distinct(id, day) %>%
+  mutate(expected_datetime =
+           purrr::map(day, ~make_datetime(year = 2023, month = 1, day = .x,
+                                          hour = expected_times_per_day))) %>%
+  unnest(expected_datetime)
+
+###end of creating data for demonstration
+
+ema_df <- expected_grid %>%
+  left_join(ema_df,
+            by = c("id", "day", "expected_datetime" = "datetime")) %>%
+  rename(datetime = expected_datetime) %>%
+  mutate(
+    missed_prompt = if_else(is.na({{prompt_var}}), 1L, 0L)
+  )
+```
+
+---
+
+#Option 3) Handling Random or Semi-Random EMA Schedules (Reconstructing Expected Prompts)
+
+### Case 1 – Scheduled times available
+Merge a **complete schedule** with **completed responses**.
+
+### **User inputs**
+- `scheduled_df`: dataset with all scheduled prompts (`id`, `day`, `scheduled_time`)  
+- `completed_df`: dataset with completed prompts (`id`, `day`, `response_time`, survey variables...)  
+- Column mapping for the join: `scheduled_time` ↔ `response_time`
+
+### **New variables created**
+- `datetime`: scheduled timestamp for each prompt  
+- `missed_prompt` (0/1): 1 if no response was recorded for that scheduled time
+
+```{r case1-template}
+# Example dummy data for demonstration
+scheduled_df <- expand.grid(
+  id = 1:2,
+  day = 1:2,
+  scheduled_time = make_datetime(2023, 1, 1, c(8, 10, 12, 14, 16, 18))
+)
+
+completed_df <- scheduled_df %>%
+  filter(!(id == 1 & day == 1 & hour(scheduled_time) == 12)) %>%  # simulate a missed prompt
+  mutate(response_time = scheduled_time,
+         mood = rnorm(n(), 50, 10),
+         stress = rnorm(n(), 50, 10))
+
+###end of creating data for demonstration
+
+ema_df <- scheduled_df %>%
+  left_join(completed_df, by = c("id", "day", "scheduled_time" = "response_time")) %>%
+  rename(datetime = scheduled_time) %>%
+  mutate(
+    missed_prompt = if_else(rowSums(!is.na(across(where(is.numeric)))) == 0, 1L, 0L)
+  )
+```
+
+---
+
+### Case 2 – Scheduled times not available, but number of prompts per day known
+Reconstruct plausible expected prompts using **median observed times** per prompt-slot.
+
+⚠️ **Important**  
+Before running this section, ensure that a dataset named `ema_df` is loaded in your R environment.  
+If you are using this tutorial with the simulated data provided above, make sure you have already executed the chunk labeled **“Optional Helper: Simulate Example EMA Data.”**
+
+This section reconstructs likely expected prompt times based on the median timing of observed prompts, assuming a fixed number of daily prompts for each participant.
+
+
+### **User inputs**
+- `n_prompts_per_day`: fixed number of prompts per day  
+- `time_window_start`, `time_window_end`: first/last hour of the daily sampling window  
+- Optional: `anchor_year`, `anchor_month` for constructing POSIXct times
+
+### **New variables created**
+- `prompt_slot` (1…n): position of the expected prompt within the day  
+- `expected_datetime`: reconstructed timestamp for each expected prompt  
+- `missed_prompt` (0/1): 1 if no response observed in that slot
+
+```{r case2-working}
+n_prompts_per_day <- 6     # number of prompts per day
+time_window_start <- 8     # first prompt window start hour (e.g., 8 AM)
+time_window_end   <- 20    # last prompt window end hour (e.g., 8 PM)
+
+# 1) Median observed hour for each prompt position (uses existing prompt_num)
+observed_times <- ema_df %>%
+  dplyr::mutate(hour = lubridate::hour(datetime)) %>%
+  dplyr::group_by(prompt_num) %>%
+  dplyr::summarise(median_hour = median(hour, na.rm = TRUE), .groups = "drop")
+
+# If any slots are missing, fill with evenly spaced hours across window
+if (nrow(observed_times) < n_prompts_per_day || any(is.na(observed_times$median_hour))) {
+  observed_times <- tibble::tibble(
+    prompt_slot = seq_len(n_prompts_per_day),
+    median_hour = seq(time_window_start, time_window_end, length.out = n_prompts_per_day)
+  )
+} else {
+  # standardize name to prompt_slot
+  observed_times <- observed_times %>%
+    dplyr::rename(prompt_slot = prompt_num)
+}
+
+# 2) Build full expected grid: every id/day × prompt_slot
+expected_grid <- ema_df %>%
+  dplyr::distinct(id, day) %>%
+  tidyr::expand_grid(prompt_slot = seq_len(n_prompts_per_day)) %>%
+  dplyr::mutate(
+    expected_datetime = lubridate::make_datetime(
+      year = 2023, month = 1, day = day,
+      hour = observed_times$median_hour[prompt_slot]
+    )
+  )
+
+# 3) Merge expected grid to observed data, avoid duplicate prompt_num, flag misses
+ema_df <- expected_grid %>%
+  dplyr::left_join(
+    ema_df %>% dplyr::select(-dplyr::any_of("prompt_num")),
+    by = c("id", "day", "expected_datetime" = "datetime")
+  ) %>%
+  dplyr::rename(
+    datetime   = expected_datetime,
+    prompt_num = prompt_slot
+  ) %>%
+  dplyr::mutate(
+    missed_prompt = dplyr::if_else(is.na(mood) & is.na(stress), 1L, 0L)
+  )
+
+# 4) Quick check
+ema_df %>%
+  dplyr::group_by(id, day) %>%
+  dplyr::summarise(
+    total_prompts = dplyr::n(),
+    missed        = sum(missed_prompt),
+    .groups       = "drop"
+  )
+
+```
+
+---
+
+# 2  Fill Person-Level (Level 2) Variables
+
+### **User inputs**
+- `level2_vars`: variables constant within participant (e.g., demographics)
+
+### **New variables created**
+- none (fills existing columns across all rows)
+
+```{r fill-level2}
+level2_vars <- c("age","gender")
+
+ema_df <- ema_df %>%
+  group_by(id) %>%
+  tidyr::fill(all_of(level2_vars), .direction="downup") %>%
+  ungroup()
+```
+
+---
+
+# 3  Create Lagged Variables
+
+### **User inputs**
+- `vars_to_lag`: variables to lag  
+- `max_lag`: maximum lag order
+
+### **New variables created**
+- `variable_lag1`, `variable_lag2`, …: lagged versions up to `max_lag`
+
+```{r create-lags}
+vars_to_lag <- c("mood","stress")
+max_lag <- 2
+
+for(lag in 1:max_lag){
+  ema_df <- ema_df %>%
+    group_by(id,day) %>%
+    mutate(across(all_of(vars_to_lag),
+                  ~dplyr::lag(.x, lag),
+                  .names="{.col}_lag{lag}")) %>%
+    ungroup()
+}
+```
+
+---
+
+# 4  Within-Person Centering
+
+### **User inputs**
+- `focal_vars`: variables to center
+
+### **New variables created**
+- `variable_WP`: within-person deviation  
+- `variable_BP`: person mean (between-person)
+
+```{r wp-centering}
+focal_vars <- c("mood","stress")
+
+ema_df <- ema_df %>%
+  group_by(id) %>%
+  mutate(across(all_of(focal_vars),
+                list(WP = ~.x - mean(.x, na.rm=TRUE),
+                     BP = ~mean(.x, na.rm=TRUE)),
+                .names="{.col}_{.fn}")) %>%
+  ungroup()
+```
+
+---
+
+# 5  Individual SD (iSD) Variables
+
+### **User inputs**
+- `vars_for_iSD`: variables for which to compute iSD
+
+### **New variables created**
+- `variable_iSD`: per-person SD
+
+```{r iSD}
+vars_for_iSD <- c("mood","stress")
+
+iSD_df <- ema_df %>%
+  group_by(id) %>%
+  summarise(across(all_of(vars_for_iSD),
+                   ~sd(.x, na.rm=TRUE),
+                   .names="{.col}_iSD"),
+            .groups="drop")
+
+ema_df <- left_join(ema_df, iSD_df, by="id")
+```
+
+---
+
+# 6  Diagnostics and QA Visualizations
+
+```{r diagnostics}
+compliance <- ema_df %>%
+  group_by(id) %>%
+  summarise(prompts_total = n(),
+            prompts_missed = sum(missed_prompt),
+            compliance = 1 - prompts_missed / prompts_total)
+
+print(compliance)
+
+gg <- ggplot(ema_df, aes(x = prompt_num, y = factor(id), fill = factor(missed_prompt))) +
+  geom_tile(color = "gray80") +
+  scale_fill_manual(values = c("0" = "white", "1" = "red"),
+                    name = "Missed") +
+  labs(title = "Prompt completion grid",
+       x = "Prompt within day", y = "Participant")
+ggplotly(gg)
+```
+
+---
+
+# 7  Export Prepared Data
+
+```{r export}
+write.csv(ema_df, "ema_prepared.csv", row.names = FALSE)
+write.csv(iSD_df, "ema_personlevel_iSD.csv", row.names = FALSE)
+```
+
+---
+
+# 8  Next Step
+Proceed to **Step 2**: evaluate the utility of candidate auxiliary variables
+in predicting missingness using `ema_prepared.csv`.
+
+---
