@@ -48,7 +48,7 @@ Step 3: Use the EMAuxiliary() function (located in functions/EMAuxiliary.R) to g
     * 📁 `functions/`
         * 📄 `EMAuxiliary.R`
         * 📄 `EMAuxiliary Reference Manual.pdf`
-    * 📁 `example output files/`
+    * 📁 `example_output/`
         * 📄 `Step1_PrepareEMA.html`
         * 📄 `Step2_AuxEval.html`
         * 📄 `Step3_ExamplesEMAuxiliary.html`
