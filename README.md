@@ -27,8 +27,7 @@ Each component is fully stand-alone and can be run independently, but the workfl
 - **R interface for Blimp (rblimp)**:
   ```r
   remotes::install_github("blimp-stats/rblimp")
-Required R packages:
-dplyr, tidyr, lme4, broom.mixed, gt, DT, lubridate, ggplot2, plotly, data.table, purrr
+
 
 ### 2. Using the Tutorials
    
@@ -45,7 +44,7 @@ EMAuxiliary-Workflow/
 
 ├── Step1_PrepareEMA.Rmd
 
-├── Step2_EvaluateAux.Rmd
+├── Step2_AuxEval.Rmd
 
 ├── Step3_ExamplesEMAuxiliary.Rmd
 
@@ -54,6 +53,14 @@ EMAuxiliary-Workflow/
 ├     └── EMAuxiliary.R
 
 ├     └── EMAuxiliary Reference Manual.pdf
+
+├── example output files/
+
+├     └── Step1_PrepareEMA.html
+
+├     └── Step2_AuxEval.html
+
+├     └── Step3_ExamplesEMAuxiliary.html
 
     
 ## 📎 Citation and Archival Links
