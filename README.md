@@ -53,31 +53,6 @@ Step 3: Use the EMAuxiliary() function (located in functions/EMAuxiliary.R) to g
         * 📄 `Step2_AuxEval.html`
         * 📄 `Step3_ExamplesEMAuxiliary.html`
 
-
-EMAuxiliary-Workflow/
-
-├── README.md
-
-├── Step1_PrepareEMA.Rmd
-
-├── Step2_AuxEval.Rmd
-
-├── Step3_ExamplesEMAuxiliary.Rmd
-
-├── functions/
-
-├────└── EMAuxiliary.R
-
-├────└── EMAuxiliary Reference Manual.pdf
-
-├── example output files/
-
-├────└── Step1_PrepareEMA.html
-
-├────└── Step2_AuxEval.html
-
-├────└── Step3_ExamplesEMAuxiliary.html
-
     
 ## 📎 Citation and Archival Links
 GitHub repository (latest version): https://github.com/schneids111/EMAuxiliary-Workflow
