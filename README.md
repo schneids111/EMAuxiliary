@@ -36,7 +36,7 @@ Step 1: Run relevant pieces of the notebook Step1_EMA_DataPrep.Rmd to reconstruc
 
 Step 2: Run Step2_AuxEval.Rmd using ema_prepared.csv as input. This will output ranked candidate auxiliaries.
 
-Step 3: Use the EMAuxiliary() function (located in functions/EMAuxiliary.R) to generate a Blimp model that includes your selected auxiliaries. Run Step3_ExamplesEMAuxiliary for tutorial.
+Step 3: Use the EMAuxiliary() function (located in functions/EMAuxiliary.R) to generate a Blimp model that includes your selected auxiliaries. Run Step3_ExamplesEMAuxiliary.Rmd for tutorial.
 
 ## 📦 Repository Contents
 EMAuxiliary-Workflow/
