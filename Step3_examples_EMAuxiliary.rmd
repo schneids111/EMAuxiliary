@@ -127,7 +127,7 @@ fit1 <- EMAuxiliary(
   data = dat, id = "id", 
   center_group = "x",
   center_grand = "m",
-  burn = 5000, iter = 5000
+  burn = 8000, iter = 2000
 )
 
 cat(fit1$blimp_code)         # show generated BLIMP program code
