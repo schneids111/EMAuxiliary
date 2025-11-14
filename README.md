@@ -13,7 +13,7 @@ This repository accompanies the paper:
 |------|----------|---------------------|
 | **Step 1 – Prepare EMA Data** (`Step1_EMA_DataPrep.Rmd`) | Helps create a complete long-format EMA dataset where each scheduled prompt—completed or missed—is represented. Add lagged variables, within-person centering, and person-level summaries. | `ema_prepared.csv` |
 | **Step 2 – Evaluate Auxiliary Variables** (`Step2_AuxEval.Rmd`) | Evaluate and rank potential auxiliary variables based on prediction of missingness and correlations with focal variables. | ranked table of auxiliary variables |
-| **Step 3 – Fit Models with EMAuxiliary** (`Step3_ExamplesEMAuxiliary.Rmd`, `functions/EMAuxiliary.R`) | Incorporate selected auxiliaries into multilevel models in **Blimp**. Handles latent centering, variable typing, and Bayesian convergence diagnostics automatically. | full Blimp output and model estimates |
+| **Step 3 – Fit Models with EMAuxiliary** (`Step3_ExamplesEMAuxiliary.Rmd`, `functions/EMAuxiliary.R`) | Incorporate selected auxiliaries into multilevel models in **Blimp**. | full Blimp output and model estimates |
 
 Each component is fully stand-alone and can be run independently, but the workflow is designed to flow from one step to the next.
 
